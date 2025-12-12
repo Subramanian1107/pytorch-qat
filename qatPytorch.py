@@ -6,6 +6,8 @@ from torch.ao.quantization import (
     FakeQuantize,
     MovingAverageMinMaxObserver,
     MovingAveragePerChannelMinMaxObserver,
+    PerChannelMinMaxObserver,
+    HistogramObserver,
     QConfig,
     prepare_qat,
     convert,
@@ -13,7 +15,7 @@ from torch.ao.quantization import (
     DeQuantStub,
     fuse_modules,
 )
-
+import ipdb
 
 import numpy as np
 import torch
@@ -141,14 +143,20 @@ def run_numpy_model_int(x_q):
     x_zp = params["quant.activation"]["zp_a"]
     w_q = conv["weight_int"]          # int8 weights
     w_zp = conv["zp_w"]               # per-channel zero points
+    print("Input zp: \n", x_zp)
+    print("Conv weights int: \n", w_q)
+    print("Conv zp: \n", w_zp)
+    print("Conv weights scales: \n", conv["scale_w"])
+    print("Input scales: \n", params["quant.activation"]["scale_a"])
+    print("Conv output scale: \n", params["conv.activation"]["scale_a"])
     scale_conv = conv["scale_w"] * params["quant.activation"]["scale_a"] / params["conv.activation"]["scale_a"]
     scale_conv_reshaped = scale_conv.reshape(1, -1, 1, 1)
     out_conv_int = conv2d_int8_explicit_zp(x_q, w_q, x_zp, w_zp)
     # Requantize conv output to int8/quint8
     out_conv_q = requantize(out_conv_int, scale_conv_reshaped, params["conv.activation"]["zp_a"])
     print("output (quantized):", out_conv_q[0, 0, 0:3, 0:3])
-    out_conv_float = dequantize(out_conv_q, params["conv.activation"]["scale_a"], params["conv.activation"]["zp_a"])
-    return out_conv_float
+    """out_conv_float = dequantize(out_conv_q, params["conv.activation"]["scale_a"], params["conv.activation"]["zp_a"])
+    return out_conv_float"""
     # --------------------
     # FC layer (int32)
     # --------------------
@@ -203,7 +211,7 @@ class SimpleCNN(nn.Module):
 # Activation fake-quant: per-tensor symmetric int8
 # Activation fake-quant: per-tensor unsigned int8 (0..255) for FBGEMM
 activation_fake_quant = FakeQuantize.with_args(
-    observer=MovingAverageMinMaxObserver.with_args(
+    observer=HistogramObserver.with_args(
         dtype=torch.quint8,            # <-- unsigned for FBGEMM
         qscheme=torch.per_tensor_symmetric,
         reduce_range=False,
@@ -217,7 +225,7 @@ activation_fake_quant = FakeQuantize.with_args(
 
 # Weight fake-quant: per-channel symmetric int4 range (-8 .. 7)
 weight_fake_quant = FakeQuantize.with_args(
-    observer=MovingAveragePerChannelMinMaxObserver.with_args(
+    observer=PerChannelMinMaxObserver.with_args(
         dtype=torch.qint8,                      # storage dtype used by observer API
         qscheme=torch.per_channel_symmetric,    # symmetric per-channel
         reduce_range=False,
@@ -252,10 +260,9 @@ model.qconfig = qconfig_int4w_int8a
 
 # Prepare for QAT (this inserts FakeQuantize modules according to qconfig)
 # inplace=True will modify the model in-place; set to False to get a prepared copy
+model.train()
 prepare_qat(model, inplace=True)
 
-# Switch to train mode for QAT
-model.train()
 
 # -------------------------
 # Toy training loop (replace with your real dataloader)
@@ -263,7 +270,7 @@ model.train()
 optimizer = optim.SGD(model.parameters(), lr=1e-3)
 criterion = nn.CrossEntropyLoss()
 
-for step in range(10):
+for step in range(5000):
     x = torch.randn(8, 1, 28, 28)
     y = torch.randint(0, 10, (8,))
 
@@ -398,19 +405,6 @@ torch.save(quantized_model.state_dict(), "quantized_model.pth")
 torch.save(quantized_model, "quantized_model_full.pth")
 
 print("Converted model type:", type(quantized_model))
-# Quick test inference on a dummy input
-with torch.no_grad():
-    out_q = quantized_model(torch.randn(1, 1, 28, 28))
-print("Quantized model output shape:", out_q.shape)
-
-x = torch.zeros(1, 1, 28, 28)
-print(x)
-with torch.no_grad():
-    y_torch = quantized_model(x).numpy()
-
-np.save("input.npy", x.numpy())
-
-print("PyTorch quantized output:\n", y_torch)
 
 # -------------------------
 # Optional: inspect a quantized weight tensor (they will be stored as qint8, but values constrained to -8..7)
@@ -435,21 +429,24 @@ with torch.no_grad():
     # 2. Extract the raw integer representation (quint8)
     x_q_numpy = x_quantized_tensor.int_repr().cpu().numpy()
 
-    x_float_numpy = x_quantized_tensor.dequantize().numpy()
-
-x_quant_numpy = quantize(x_float_numpy, params["quant.activation"]["scale_a"], params["quant.activation"]["zp_a"])
-print("Input numpy output (quantized):", x_quantized_tensor[0, 0, 0:3, 0:3])
-print("Input numpy output (quantized):", x_quant_numpy[0, 0, 0:3, 0:3])
-print("Input numpy output (quantized):", x_q_numpy[0, 0, 0:3, 0:3])
 y_numpy = run_numpy_model_int(x_q_numpy)
 print(fc_act["scale_a"])
 print(fc_act["zp_a"])
 y_numpy_float = dequantize(y_numpy, fc_act["scale_a"], fc_act["zp_a"])
-print(y_numpy.shape)
 print(y_numpy_float.dtype)
-print("NumPy output:\n", y_numpy[0, 0, 0:3, 0:3])
+print("NumPy output:\n", y_numpy_float)
+quantized_model.eval()
 with torch.no_grad():
     y_torch = quantized_model(x).numpy()
-print(y_torch.shape)
-print(y_torch.dtype)
 print("Torch output:\n", y_torch)
+
+diff = y_numpy_float - y_torch
+print("Final Outputs MAE:", np.mean(np.abs(diff)))
+print("Final Outputs Max Error:", np.max(np.abs(diff)))
+
+print("TF first values:", y_numpy_float.flatten()[:10])
+print("NP first values:", y_torch.flatten()[:10])
+print("Diff first values:", diff.flatten()[:10])
+
+
+ipdb.set_trace()
